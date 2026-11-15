@@ -1,309 +1,1121 @@
-  #define _WINSOCK_DEPRECATED_NO_WARNINGS
-#define WIN32_LEAN_AND_MEAN
+﻿#define WIN32_LEAN_AND_MEAN
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0600
+#endif
+#ifdef _MSC_VER
+#pragma execution_character_set("utf-8")
+#endif
 
-#include <stdio.h>
-#include <stdlib.h>
 #include <winsock2.h>
-#include <iphlpapi.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <iphlpapi.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <process.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
-#define MAX_DHCP_SERVERS 32
-#define MAX_ADAPTERS 32
+#define DHCP_PACKET_SIZE 576
+#define DHCP_SCAN_WINDOW_MS 2000
+#define DHCP_RETRY_INTERVAL_MS 1000
+#define TABLE_MAX_COLUMNS 8
+#define TABLE_CELL_CAPACITY 512
+#define HEADER_COLOR_DISCOVERY \
+    (FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY)
 
 typedef struct {
-    char server_ip[16];
-    time_t first_seen;
-    int used;
+    char name[256];
+    char description[256];
+    char ipv4[INET_ADDRSTRLEN];
+    unsigned char mac[6];
+    ULONG interface_index;
+    int has_ipv4;
+    int has_mac;
+    int is_up;
+} AdapterInfo;
+
+typedef struct {
+    char server_ip[INET_ADDRSTRLEN];
+    char server_mac[18];
+    char device_vendor[160];
+    char assigned_ip[INET_ADDRSTRLEN];
+    char subnet_mask[INET_ADDRSTRLEN];
+    char gateway[INET_ADDRSTRLEN];
+    char dns[96];
+    char lease[32];
+    unsigned long long response_ms;
+    SYSTEMTIME discovered_at;
+    size_t adapter_number;
 } DHCPServer;
 
 typedef struct {
-    char AdapterName[256];
-    char Description[256];
-    char Ip[16];
-    unsigned char Mac[8];
-} AdapterInfo;
+    char server_ip[INET_ADDRSTRLEN];
+    char assigned_ip[INET_ADDRSTRLEN];
+    char subnet_mask[INET_ADDRSTRLEN];
+    char gateway[96];
+    char dns[96];
+    char hostname[64];
+    char vendor_class[64];
+    char lease[32];
+} DHCPOffer;
 
-DHCPServer found_servers[MAX_DHCP_SERVERS];
-int found_count = 0;
-CRITICAL_SECTION cs_servers;
+typedef struct {
+    unsigned char prefix[6];
+    unsigned char prefix_nibbles;
+    char vendor[160];
+} OUIRecord;
 
-AdapterInfo adapters[MAX_ADAPTERS];
-int adapters_count = 0;
+static DHCPServer* g_servers;
+static size_t g_server_count;
+static size_t g_server_capacity;
+static OUIRecord* g_oui_records;
+static size_t g_oui_record_count;
+static size_t g_oui_record_capacity;
+static HANDLE g_console_handle = INVALID_HANDLE_VALUE;
+static WORD g_console_attributes;
+static int g_console_colors_enabled;
 
-// 清屏函数，兼容Win10/11命令行
-void clear_screen() {
-    HANDLE hStdOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    CONSOLE_SCREEN_BUFFER_INFO csbi;
-    DWORD count, cellCount;
-    COORD homeCoords = { 0, 0 };
-    if (hStdOut == INVALID_HANDLE_VALUE) return;
-    if (!GetConsoleScreenBufferInfo(hStdOut, &csbi)) return;
-    cellCount = csbi.dwSize.X * csbi.dwSize.Y;
-    if (!FillConsoleOutputCharacter(hStdOut, (TCHAR)' ', cellCount, homeCoords, &count)) return;
-    if (!FillConsoleOutputAttribute(hStdOut, csbi.wAttributes, cellCount, homeCoords, &count)) return;
-    SetConsoleCursorPosition(hStdOut, homeCoords);
+static void copy_ipv4(char* destination, size_t capacity, const unsigned char* address)
+{
+    struct in_addr ipv4;
+    memcpy(&ipv4.s_addr, address, sizeof(ipv4.s_addr));
+    if (InetNtopA(AF_INET, &ipv4, destination, (DWORD)capacity) == NULL)
+        destination[0] = '\0';
 }
 
-void print_server_list() {
-    clear_screen();
-    EnterCriticalSection(&cs_servers);
-    printf("[DHCP服务器列表]\n");
-    printf("编号 | 首次发现时间        | 服务器IP\n");
-    printf("---- | ------------------- | ---------------\n");
-    for (int i = 0; i < found_count; ++i) {
-        if (found_servers[i].used) {
-            char timestr[32];
-            struct tm tm_info;
-            localtime_s(&tm_info, &found_servers[i].first_seen);
-            strftime(timestr, sizeof(timestr), "%Y-%m-%d %H:%M:%S", &tm_info);
-            printf("%-4d | %-19s | %-15s\n", i + 1, timestr, found_servers[i].server_ip);
+static void copy_option_text(char* destination, size_t capacity,
+                             const unsigned char* value, size_t length)
+{
+    size_t i;
+    size_t copied = 0;
+    for (i = 0; i < length && copied + 1 < capacity; ++i) {
+        unsigned char c = value[i];
+        if (c == 0)
+            break;
+        destination[copied++] = (c >= 32 && c <= 126 && c != '|') ? (char)c : '_';
+    }
+    destination[copied] = '\0';
+}
+
+static int format_address_list(char* destination, size_t capacity,
+                               const unsigned char* value, size_t length)
+{
+    size_t offset = 0;
+    size_t i;
+    destination[0] = '\0';
+    for (i = 0; i + 4 <= length; i += 4) {
+        char address[INET_ADDRSTRLEN];
+        size_t used;
+        copy_ipv4(address, sizeof(address), value + i);
+        if (address[0] == '\0')
+            continue;
+        used = strlen(destination);
+        if (used && used + 2 < capacity) {
+            destination[used++] = ',';
+            destination[used++] = ' ';
+            destination[used] = '\0';
         }
+        if (used < capacity)
+            offset = used;
+        if (offset >= capacity)
+            break;
+        if (strncpy_s(destination + offset, capacity - offset, address, _TRUNCATE) != 0)
+            break;
     }
-    printf("\n");
-    LeaveCriticalSection(&cs_servers);
+    return destination[0] != '\0';
 }
 
-void print_adapter_list() {
-    ULONG buflen = 15000;
-    IP_ADAPTER_INFO* pAdapterInfo = (IP_ADAPTER_INFO*)malloc(buflen);
-    if (GetAdaptersInfo(pAdapterInfo, &buflen) == ERROR_BUFFER_OVERFLOW) {
-        free(pAdapterInfo);
-        pAdapterInfo = (IP_ADAPTER_INFO*)malloc(buflen);
-    }
-    if (GetAdaptersInfo(pAdapterInfo, &buflen) == NO_ERROR) {
-        IP_ADAPTER_INFO* p = pAdapterInfo;
-        int idx = 0;
-        while (p && idx < MAX_ADAPTERS) {
-            strncpy_s(adapters[idx].AdapterName, sizeof(adapters[idx].AdapterName), p->AdapterName, _TRUNCATE);
-            strncpy_s(adapters[idx].Description, sizeof(adapters[idx].Description), p->Description, _TRUNCATE);
-            strncpy_s(adapters[idx].Ip, sizeof(adapters[idx].Ip), p->IpAddressList.IpAddress.String, _TRUNCATE);
-            memset(adapters[idx].Mac, 0, sizeof(adapters[idx].Mac));
-            memcpy(adapters[idx].Mac, p->Address, p->AddressLength > 8 ? 8 : p->AddressLength);
-
-            printf(" [%d] %s (%s) IP: %s\n", idx + 1, p->AdapterName, p->Description, p->IpAddressList.IpAddress.String);
-
-            p = p->Next;
-            idx++;
-        }
-        adapters_count = idx;
-    }
-    free(pAdapterInfo);
-}
-
-int server_exists(const char* ip) {
-    for (int i = 0; i < found_count; ++i) {
-        if (found_servers[i].used && strcmp(ip, found_servers[i].server_ip) == 0)
-            return i;
-    }
-    return -1;
-}
-
-void add_server(const char* ip) {
-    EnterCriticalSection(&cs_servers);
-    if (server_exists(ip) == -1 && found_count < MAX_DHCP_SERVERS) {
-        strncpy_s(found_servers[found_count].server_ip, sizeof(found_servers[found_count].server_ip), ip, _TRUNCATE);
-        found_servers[found_count].first_seen = time(NULL);
-        found_servers[found_count].used = 1;
-        found_count++;
-        print_server_list();
-    }
-    LeaveCriticalSection(&cs_servers);
-}
-
-// 构造DHCP Discover包
-int build_dhcp_discover(unsigned char* buf, int bufsize, unsigned char* mac, int maclen, unsigned int xid) {
-    if (bufsize < 548) return 0; // DHCP最小包长度
-    memset(buf, 0, bufsize);
-
-    buf[0] = 1; // op: BOOTREQUEST
-    buf[1] = 1; // htype: Ethernet
-    buf[2] = 6; // hlen: MAC length
-    buf[3] = 0; // hops
-    *(unsigned int*)&buf[4] = htonl(xid); // xid
-    buf[8] = 0; buf[9] = 0; // secs
-    buf[10] = 0x80; buf[11] = 0x00; // flags: broadcast
-    // ciaddr/yiaddr/siaddr/giaddr: 0
-    // chaddr
-    memcpy(&buf[28], mac, maclen > 16 ? 16 : maclen);
-
-    // magic cookie
-    buf[236] = 99; buf[237] = 130; buf[238] = 83; buf[239] = 99;
-
-    int idx = 240;
-    // DHCP message type
-    buf[idx++] = 53; buf[idx++] = 1; buf[idx++] = 1; // DHCP Discover
-    // Parameter Request List (option 55)
-    buf[idx++] = 55; buf[idx++] = 3; buf[idx++] = 1; buf[idx++] = 3; buf[idx++] = 6;
-    // End option
-    buf[idx++] = 0xff;
-    return idx; // 返回包长度
-}
-
-// 捕获DHCP OFFER/ACK消息，提取server identifier
-void process_dhcp_packet(const char* buf, int len, const char* ifname) {
-    if (len < 240) return; // 不可能是DHCP
-    const unsigned char* pkt = (const unsigned char*)buf;
-    if (pkt[236] != 99 || pkt[237] != 130 || pkt[238] != 83 || pkt[239] != 99)
-        return; // magic cookie不符
-
-    int idx = 240;
-    int found_offer = 0;
-    while (idx < len) {
-        unsigned char option = pkt[idx++];
-        if (option == 0xff) break;
-        if (option == 0) continue;
-        if (idx >= len) break;
-        unsigned char optlen = pkt[idx++];
-        if (idx + optlen > len) break;
-        if (option == 53) {
-            if (pkt[idx] == 2 || pkt[idx] == 5) // OFFER/ACK
-                found_offer = 1;
-        }
-        if (option == 54 && optlen == 4) {
-            char sip[16];
-            snprintf(sip, 16, "%u.%u.%u.%u", pkt[idx], pkt[idx + 1], pkt[idx + 2], pkt[idx + 3]);
-            if (found_offer) {
-                add_server(sip);
-            }
-            return;
-        }
-        idx += optlen;
-    }
+static void format_mac(char* destination, size_t capacity, const unsigned char* mac)
+{
+    _snprintf_s(destination, capacity, _TRUNCATE, "%02X:%02X:%02X:%02X:%02X:%02X",
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 typedef struct {
-    SOCKET sock;
-    AdapterInfo* adapter;
-    struct sockaddr_in to;
-} ThreadArgs;
+    unsigned char prefix[3];
+    const char* vendor;
+} OuiEntry;
 
-unsigned __stdcall sender_thread(void* arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    unsigned char discover[548];
-    unsigned int xid = (unsigned int)time(NULL);
-    while (1) {
-        int discover_len = build_dhcp_discover(discover, sizeof(discover), args->adapter->Mac, 6, xid++);
-        sendto(args->sock, (const char*)discover, discover_len, 0, (struct sockaddr*)&args->to, sizeof(args->to));
-        Sleep(1000);
-    }
-    return 0;
+static const OuiEntry g_oui_table[] = {
+    { { 0x00, 0x1B, 0x2F }, "Cisco" },
+    { { 0x00, 0x1E, 0x10 }, "TP-Link" },
+    { { 0x14, 0xCC, 0x20 }, "TP-Link" },
+    { { 0x50, 0xC7, 0xBF }, "TP-Link" },
+    { { 0xC0, 0x25, 0xE9 }, "TP-Link" },
+    { { 0x00, 0x1F, 0xA4 }, "Netgear" },
+    { { 0x20, 0x4E, 0x7F }, "Netgear" },
+    { { 0xA0, 0x40, 0xA0 }, "Netgear" },
+    { { 0x00, 0x1D, 0x0F }, "D-Link" },
+    { { 0x1C, 0x7E, 0xE5 }, "D-Link" },
+    { { 0x00, 0x18, 0x82 }, "D-Link" },
+    { { 0x00, 0x1E, 0x58 }, "Huawei" },
+    { { 0x00, 0x25, 0x9E }, "Huawei" },
+    { { 0x48, 0x46, 0xFB }, "Huawei" },
+    { { 0x00, 0x0C, 0xE7 }, "ZTE" },
+    { { 0x34, 0x4B, 0x50 }, "ZTE" },
+    { { 0x00, 0x1C, 0xDF }, "Billion" },
+    { { 0x00, 0x24, 0x01 }, "Apple" },
+    { { 0x3C, 0x07, 0x54 }, "Apple" },
+    { { 0x00, 0x50, 0x56 }, "VMware" },
+    { { 0x08, 0x00, 0x27 }, "VirtualBox" },
+    { { 0x00, 0x15, 0x5D }, "Hyper-V" }
+};
+
+static int hex_nibble(char value)
+{
+    if (value >= '0' && value <= '9')
+        return value - '0';
+    if (value >= 'A' && value <= 'F')
+        return value - 'A' + 10;
+    if (value >= 'a' && value <= 'f')
+        return value - 'a' + 10;
+    return -1;
 }
 
-unsigned __stdcall receiver_thread(void* arg) {
-    ThreadArgs* args = (ThreadArgs*)arg;
-    char buf[1024];
-    struct sockaddr_in from;
-    int fromlen = sizeof(from);
-    while (1) {
-        fd_set readfds;
-        struct timeval tv;
-        FD_ZERO(&readfds);
-        FD_SET(args->sock, &readfds);
-        tv.tv_sec = 0;
-        tv.tv_usec = 300000;
-        int ready = select(0, &readfds, NULL, NULL, &tv);
-        if (ready > 0 && FD_ISSET(args->sock, &readfds)) {
-            int ret = recvfrom(args->sock, buf, sizeof(buf), 0, (struct sockaddr*)&from, &fromlen);
-            if (ret > 0) {
-                process_dhcp_packet(buf, ret, args->adapter->Description);
+static int parse_oui_line(const char* line, OUIRecord* record)
+{
+    const char* marker = strstr(line, "(hex)");
+    const char* cursor = line;
+    const char* vendor;
+    const char* end;
+    unsigned char nibbles[12];
+    size_t nibble_count = 0;
+    size_t i;
+
+    if (!marker)
+        return 0;
+    while (cursor < marker) {
+        int value = hex_nibble(*cursor);
+        if (value >= 0) {
+            if (nibble_count == sizeof(nibbles))
+                return 0;
+            nibbles[nibble_count++] = (unsigned char)value;
+        } else if (*cursor != '-' && *cursor != ':' &&
+                   *cursor != ' ' && *cursor != '\t') {
+            return 0;
+        }
+        ++cursor;
+    }
+    if (nibble_count < 6)
+        return 0;
+
+    memset(record, 0, sizeof(*record));
+    record->prefix_nibbles = (unsigned char)nibble_count;
+    for (i = 0; i < nibble_count; ++i) {
+        if ((i & 1) == 0)
+            record->prefix[i / 2] = (unsigned char)(nibbles[i] << 4);
+        else
+            record->prefix[i / 2] |= nibbles[i];
+    }
+
+    vendor = marker + 5;
+    while (*vendor == ' ' || *vendor == '\t')
+        ++vendor;
+    end = vendor + strlen(vendor);
+    while (end > vendor && (end[-1] == '\r' || end[-1] == '\n' ||
+                            end[-1] == ' ' || end[-1] == '\t'))
+        --end;
+    if (end == vendor)
+        return 0;
+    {
+        size_t vendor_length = (size_t)(end - vendor);
+        if (vendor_length >= sizeof(record->vendor))
+            vendor_length = sizeof(record->vendor) - 1;
+        memcpy(record->vendor, vendor, vendor_length);
+        record->vendor[vendor_length] = '\0';
+    }
+    return record->vendor[0] != '\0';
+}
+
+static FILE* open_oui_file_in_directory(const char* directory,
+                                        char* resolved_path, size_t path_capacity)
+{
+    char candidate[MAX_PATH];
+    FILE* file = NULL;
+
+    if (directory[0] == '\0')
+        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "oui.txt");
+    else
+        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE,
+                    "%s\\oui.txt", directory);
+    if (fopen_s(&file, candidate, "rt") != 0)
+        return NULL;
+    strncpy_s(resolved_path, path_capacity, candidate, _TRUNCATE);
+    return file;
+}
+
+static FILE* open_oui_file(char* resolved_path, size_t path_capacity)
+{
+    char directory[MAX_PATH];
+    DWORD length;
+    FILE* file;
+    unsigned int depth;
+
+    length = GetCurrentDirectoryA(MAX_PATH, directory);
+    if (length > 0 && length < MAX_PATH) {
+        file = open_oui_file_in_directory(directory, resolved_path, path_capacity);
+        if (file)
+            return file;
+    }
+
+    length = GetModuleFileNameA(NULL, directory, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH)
+        return NULL;
+    {
+        char* slash = strrchr(directory, '\\');
+        if (!slash)
+            return NULL;
+        *slash = '\0';
+    }
+
+    for (depth = 0; depth < 6; ++depth) {
+        char* slash;
+        file = open_oui_file_in_directory(directory, resolved_path, path_capacity);
+        if (file)
+            return file;
+        slash = strrchr(directory, '\\');
+        if (!slash || (slash == directory + 2 && directory[1] == ':'))
+            break;
+        *slash = '\0';
+    }
+    return NULL;
+}
+
+static size_t load_oui_database(char* loaded_path, size_t path_capacity)
+{
+    char line[512];
+    FILE* file = open_oui_file(loaded_path, path_capacity);
+    if (!file)
+        return 0;
+
+    while (fgets(line, sizeof(line), file)) {
+        OUIRecord record;
+        OUIRecord* records;
+        size_t write_index;
+        if (!parse_oui_line(line, &record))
+            continue;
+        write_index = g_oui_record_count;
+        if (write_index >= g_oui_record_capacity) {
+            size_t new_capacity = g_oui_record_capacity
+                ? g_oui_record_capacity * 2 : 128;
+            records = (OUIRecord*)realloc(g_oui_records,
+                                          new_capacity * sizeof(*records));
+            if (!records) {
+                fprintf(stderr, "扩展 OUI 数据库内存失败，已保留已加载条目。\n");
+                break;
             }
+            g_oui_records = records;
+            g_oui_record_capacity = new_capacity;
         }
-    }
-    return 0;
-}
-
-int main() {
-    WSADATA wsaData;
-    SOCKET sock;
-    struct sockaddr_in local, to;
-    int fromlen = sizeof(struct sockaddr_in);
-
-    InitializeCriticalSection(&cs_servers);
-
-    printf("可用网卡列表:\n");
-    print_adapter_list();
-    if (adapters_count == 0) {
-        printf("未检测到可用网卡！\n");
-        return 1;
-    }
-
-    int sel = 0;
-    printf("请选择网卡序号（1~%d）：\n", adapters_count);
-    while (1) {
-        if (scanf_s("%d", &sel) != 1 || sel < 1 || sel > adapters_count) {
-            printf("输入无效，请重新输入(1~%d)：\n", adapters_count);
-            while (getchar() != '\n');
-        }
-        else {
+        if (write_index >= g_oui_record_capacity) {
+            fprintf(stderr, "OUI 数据库容量校验失败，停止加载。\n");
             break;
         }
+        g_oui_records[write_index] = record;
+        g_oui_record_count = write_index + 1;
+    }
+    fclose(file);
+    return g_oui_record_count;
+}
+
+static const char* lookup_oui_vendor(const unsigned char* mac)
+{
+    size_t i;
+    const OUIRecord* best_match = NULL;
+    for (i = 0; i < g_oui_record_count; ++i) {
+        const OUIRecord* record = &g_oui_records[i];
+        size_t nibble;
+        int matches = 1;
+        for (nibble = 0; nibble < record->prefix_nibbles; ++nibble) {
+            unsigned char actual = (nibble & 1)
+                ? (unsigned char)(mac[nibble / 2] & 0x0F)
+                : (unsigned char)(mac[nibble / 2] >> 4);
+            unsigned char expected = (nibble & 1)
+                ? (unsigned char)(record->prefix[nibble / 2] & 0x0F)
+                : (unsigned char)(record->prefix[nibble / 2] >> 4);
+            if (actual != expected) {
+                matches = 0;
+                break;
+            }
+        }
+        if (matches && (!best_match ||
+                        record->prefix_nibbles > best_match->prefix_nibbles))
+            best_match = record;
+    }
+    if (best_match)
+        return best_match->vendor;
+
+    for (i = 0; i < sizeof(g_oui_table) / sizeof(g_oui_table[0]); ++i) {
+        if (memcmp(mac, g_oui_table[i].prefix, sizeof(g_oui_table[i].prefix)) == 0)
+            return g_oui_table[i].vendor;
+    }
+    return "未知厂商";
+}
+
+static void build_device_vendor(char* destination, size_t capacity,
+                               const unsigned char* mac, const DHCPOffer* offer)
+{
+    const char* oui_vendor = lookup_oui_vendor(mac);
+    if (offer->vendor_class[0] && offer->hostname[0]) {
+        _snprintf_s(destination, capacity, _TRUNCATE, "%s; %s; %s",
+                    oui_vendor, offer->vendor_class, offer->hostname);
+    } else if (offer->vendor_class[0]) {
+        _snprintf_s(destination, capacity, _TRUNCATE, "%s; %s",
+                    oui_vendor, offer->vendor_class);
+    } else if (offer->hostname[0]) {
+        _snprintf_s(destination, capacity, _TRUNCATE, "%s; %s",
+                    oui_vendor, offer->hostname);
+    } else {
+        strncpy_s(destination, capacity, oui_vendor, _TRUNCATE);
+    }
+}
+
+static int get_adapters(AdapterInfo** adapters_out, size_t* count_out)
+{
+    ULONG buffer_size = 15000;
+    ULONG result;
+    IP_ADAPTER_ADDRESSES* addresses = NULL;
+    IP_ADAPTER_ADDRESSES* current;
+    AdapterInfo* adapters;
+    size_t count = 0;
+    size_t index = 0;
+
+    *adapters_out = NULL;
+    *count_out = 0;
+    for (;;) {
+        addresses = (IP_ADAPTER_ADDRESSES*)malloc(buffer_size);
+        if (!addresses) {
+            fprintf(stderr, "分配网卡信息缓冲区失败。\n");
+            return 0;
+        }
+        result = GetAdaptersAddresses(AF_INET, GAA_FLAG_INCLUDE_PREFIX,
+                                      NULL, addresses, &buffer_size);
+        if (result != ERROR_BUFFER_OVERFLOW)
+            break;
+        free(addresses);
+        addresses = NULL;
+    }
+    if (result != NO_ERROR) {
+        fprintf(stderr, "枚举网卡失败，错误码: %lu\n", result);
+        free(addresses);
+        return 0;
     }
 
-    AdapterInfo* adapter = &adapters[sel - 1];
-
-    if (strlen(adapter->Ip) == 0 || strcmp(adapter->Ip, "0.0.0.0") == 0) {
-        printf("所选网卡无有效IP地址。\n");
-        return 1;
-    }
-    printf("监听网卡: %s (%s), IP: %s\n", adapter->AdapterName, adapter->Description, adapter->Ip);
-
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        printf("WSAStartup错误\n");
-        return 1;
+    for (current = addresses; current; current = current->Next)
+        ++count;
+    adapters = (AdapterInfo*)calloc(count ? count : 1, sizeof(*adapters));
+    if (!adapters) {
+        fprintf(stderr, "分配网卡列表失败。\n");
+        free(addresses);
+        return 0;
     }
 
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        printf("创建socket失败\n");
-        WSACleanup();
-        return 1;
+    for (current = addresses; current; current = current->Next) {
+        IP_ADAPTER_UNICAST_ADDRESS* unicast;
+        AdapterInfo* adapter = &adapters[index];
+        strncpy_s(adapter->name, sizeof(adapter->name), current->AdapterName, _TRUNCATE);
+        if (current->FriendlyName) {
+            WideCharToMultiByte(CP_UTF8, 0, current->FriendlyName, -1,
+                                adapter->description, (int)sizeof(adapter->description),
+                                NULL, NULL);
+        }
+        adapter->interface_index = current->IfIndex;
+        adapter->is_up = current->OperStatus == IfOperStatusUp;
+        if (current->PhysicalAddressLength >= sizeof(adapter->mac)) {
+            memcpy(adapter->mac, current->PhysicalAddress, sizeof(adapter->mac));
+            adapter->has_mac = 1;
+        }
+
+        for (unicast = current->FirstUnicastAddress; unicast; unicast = unicast->Next) {
+            struct sockaddr_in* address;
+            if (unicast->Address.lpSockaddr->sa_family != AF_INET)
+                continue;
+            address = (struct sockaddr_in*)unicast->Address.lpSockaddr;
+            if (InetNtopA(AF_INET, &address->sin_addr, adapter->ipv4,
+                          (DWORD)sizeof(adapter->ipv4)) != NULL)
+                adapter->has_ipv4 = 1;
+            break;
+        }
+        ++index;
     }
 
-    BOOL yes = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char*)&yes, sizeof(yes));
+    free(addresses);
+    *adapters_out = adapters;
+    *count_out = count;
+    return 1;
+}
+
+static int is_wide_codepoint(unsigned int codepoint)
+{
+    return (codepoint >= 0x1100 && codepoint <= 0x115F) ||
+        (codepoint >= 0x2329 && codepoint <= 0x232A) ||
+        (codepoint >= 0x2E80 && codepoint <= 0xA4CF) ||
+        (codepoint >= 0xAC00 && codepoint <= 0xD7A3) ||
+        (codepoint >= 0xF900 && codepoint <= 0xFAFF) ||
+        (codepoint >= 0xFE10 && codepoint <= 0xFE19) ||
+        (codepoint >= 0xFE30 && codepoint <= 0xFE6F) ||
+        (codepoint >= 0xFF00 && codepoint <= 0xFF60) ||
+        (codepoint >= 0xFFE0 && codepoint <= 0xFFE6) ||
+        (codepoint >= 0x1F300 && codepoint <= 0x1FAFF) ||
+        (codepoint >= 0x20000 && codepoint <= 0x3FFFD);
+}
+
+static int is_combining_codepoint(unsigned int codepoint)
+{
+    return (codepoint >= 0x0300 && codepoint <= 0x036F) ||
+        (codepoint >= 0x1AB0 && codepoint <= 0x1AFF) ||
+        (codepoint >= 0x1DC0 && codepoint <= 0x1DFF) ||
+        (codepoint >= 0x20D0 && codepoint <= 0x20FF) ||
+        (codepoint >= 0xFE20 && codepoint <= 0xFE2F);
+}
+
+static size_t text_display_width(const char* text)
+{
+    wchar_t wide[1024];
+    int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1,
+                                    wide, (int)(sizeof(wide) / sizeof(wide[0])));
+    size_t width = 0;
+    int i;
+
+    if (count == 0)
+        return strlen(text);
+    for (i = 0; i < count - 1; ++i) {
+        unsigned int codepoint = (unsigned int)wide[i];
+        if (codepoint >= 0xD800 && codepoint <= 0xDBFF &&
+            i + 1 < count - 1 && wide[i + 1] >= 0xDC00 && wide[i + 1] <= 0xDFFF) {
+            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) +
+                ((unsigned int)wide[++i] - 0xDC00);
+        }
+        if (is_combining_codepoint(codepoint))
+            continue;
+        width += is_wide_codepoint(codepoint) ? 2 : 1;
+    }
+    return width;
+}
+
+static void print_table_border(const size_t* widths, size_t column_count)
+{
+    size_t column;
+    putchar('+');
+    for (column = 0; column < column_count; ++column) {
+        size_t i;
+        for (i = 0; i < widths[column] + 2; ++i)
+            putchar('-');
+        putchar('+');
+    }
+    putchar('\n');
+}
+
+static void print_table_row(const char* const* cells, const size_t* widths,
+                            size_t column_count)
+{
+    size_t column;
+    putchar('|');
+    for (column = 0; column < column_count; ++column) {
+        size_t width = text_display_width(cells[column]);
+        size_t padding;
+        putchar(' ');
+        fputs(cells[column], stdout);
+        for (padding = width; padding < widths[column]; ++padding)
+            putchar(' ');
+        fputs(" |", stdout);
+    }
+    putchar('\n');
+}
+
+static void initialize_console_colors(void)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    g_console_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (g_console_handle != INVALID_HANDLE_VALUE &&
+        GetConsoleScreenBufferInfo(g_console_handle, &info)) {
+        g_console_attributes = info.wAttributes;
+        g_console_colors_enabled = 1;
+    }
+}
+
+static void set_console_foreground(WORD foreground)
+{
+    if (g_console_colors_enabled) {
+        WORD attributes = (WORD)((g_console_attributes & 0xFFF0) |
+                                 (foreground & 0x000F));
+        SetConsoleTextAttribute(g_console_handle, attributes);
+    }
+}
+
+static void print_colored_table_header(const char* const* cells,
+                                       const size_t* widths,
+                                       const WORD* colors,
+                                       size_t column_count)
+{
+    size_t column;
+    putchar('|');
+    for (column = 0; column < column_count; ++column) {
+        size_t width = text_display_width(cells[column]);
+        size_t padding;
+        putchar(' ');
+        set_console_foreground(colors[column]);
+        fputs(cells[column], stdout);
+        set_console_foreground(g_console_attributes & 0x000F);
+        for (padding = width; padding < widths[column]; ++padding)
+            putchar(' ');
+        fputs(" |", stdout);
+    }
+    putchar('\n');
+}
+
+static void update_column_widths(size_t* widths, const char* const* cells,
+                                 size_t column_count)
+{
+    size_t column;
+    for (column = 0; column < column_count; ++column) {
+        size_t width = text_display_width(cells[column]);
+        if (width > widths[column])
+            widths[column] = width;
+    }
+}
+
+static void make_adapter_cells(const AdapterInfo* adapter, size_t adapter_number,
+                               char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY])
+{
+    _snprintf_s(cells[0], TABLE_CELL_CAPACITY, _TRUNCATE, "%zu", adapter_number);
+    strncpy_s(cells[1], TABLE_CELL_CAPACITY, adapter->is_up ? "启用" : "停用", _TRUNCATE);
+    strncpy_s(cells[2], TABLE_CELL_CAPACITY,
+              adapter->has_ipv4 ? adapter->ipv4 : "无 IPv4", _TRUNCATE);
+    _snprintf_s(cells[3], TABLE_CELL_CAPACITY, _TRUNCATE, "%s (%s)",
+                adapter->description[0] ? adapter->description : adapter->name,
+                adapter->name);
+}
+
+static void print_adapters(const AdapterInfo* adapters, size_t count)
+{
+    static const char* headers[] = { "网卡序号", "状态", "IPv4", "名称" };
+    size_t widths[4] = { 0, 0, 0, 0 };
+    size_t i;
+
+    printf("检测到 %zu 张网卡：\n", count);
+    for (i = 0; i < 4; ++i)
+        widths[i] = text_display_width(headers[i]);
+    for (i = 0; i < count; ++i) {
+        char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY] = { 0 };
+        const char* row[4];
+        size_t column;
+        make_adapter_cells(&adapters[i], i + 1, cells);
+        for (column = 0; column < 4; ++column)
+            row[column] = cells[column];
+        update_column_widths(widths, row, 4);
+    }
+    print_table_border(widths, 4);
+    print_table_row(headers, widths, 4);
+    print_table_border(widths, 4);
+    for (i = 0; i < count; ++i) {
+        char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY] = { 0 };
+        const char* row[4];
+        size_t column;
+        make_adapter_cells(&adapters[i], i + 1, cells);
+        for (column = 0; column < 4; ++column)
+            row[column] = cells[column];
+        print_table_row(row, widths, 4);
+    }
+    print_table_border(widths, 4);
+}
+
+static size_t make_server_cells(const DHCPServer* server, size_t sequence,
+                                int parameters,
+                                char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY])
+{
+    if (parameters) {
+        _snprintf_s(cells[0], TABLE_CELL_CAPACITY, _TRUNCATE, "%zu", sequence);
+        strncpy_s(cells[1], TABLE_CELL_CAPACITY, server->assigned_ip, _TRUNCATE);
+        strncpy_s(cells[2], TABLE_CELL_CAPACITY, server->subnet_mask, _TRUNCATE);
+        strncpy_s(cells[3], TABLE_CELL_CAPACITY, server->gateway, _TRUNCATE);
+        strncpy_s(cells[4], TABLE_CELL_CAPACITY, server->dns, _TRUNCATE);
+        strncpy_s(cells[5], TABLE_CELL_CAPACITY, server->lease, _TRUNCATE);
+        _snprintf_s(cells[6], TABLE_CELL_CAPACITY, _TRUNCATE, "%llu ms",
+                    server->response_ms);
+        return 7;
+    }
+
+    _snprintf_s(cells[0], TABLE_CELL_CAPACITY, _TRUNCATE, "%zu", sequence);
+    _snprintf_s(cells[1], TABLE_CELL_CAPACITY, _TRUNCATE, "%zu",
+                server->adapter_number);
+    _snprintf_s(cells[2], TABLE_CELL_CAPACITY, _TRUNCATE,
+                "%04u-%02u-%02u %02u:%02u:%02u",
+                (unsigned)server->discovered_at.wYear,
+                (unsigned)server->discovered_at.wMonth,
+                (unsigned)server->discovered_at.wDay,
+                (unsigned)server->discovered_at.wHour,
+                (unsigned)server->discovered_at.wMinute,
+                (unsigned)server->discovered_at.wSecond);
+    strncpy_s(cells[3], TABLE_CELL_CAPACITY, server->server_ip, _TRUNCATE);
+    strncpy_s(cells[4], TABLE_CELL_CAPACITY, server->server_mac, _TRUNCATE);
+    strncpy_s(cells[5], TABLE_CELL_CAPACITY, server->device_vendor, _TRUNCATE);
+    return 6;
+}
+
+static void print_server_table(int parameters)
+{
+    static const WORD identity_colors[] = {
+        HEADER_COLOR_DISCOVERY,
+        FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        FOREGROUND_RED | FOREGROUND_INTENSITY
+    };
+    static const WORD parameter_colors[] = {
+        HEADER_COLOR_DISCOVERY,
+        FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        FOREGROUND_GREEN | FOREGROUND_INTENSITY,
+        FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
+        FOREGROUND_RED | FOREGROUND_INTENSITY,
+        FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY
+    };
+    static const char* identity_headers[] = {
+        "发现序号", "网卡序号", "发现时间", "服务器 IP", "服务器 MAC", "设备/厂商"
+    };
+    static const char* parameter_headers[] = {
+        "发现序号", "分配 IP", "子网掩码", "网关", "DNS", "租期", "响应时间"
+    };
+    const char* const* headers = parameters ? parameter_headers : identity_headers;
+    const WORD* colors = parameters ? parameter_colors : identity_colors;
+    size_t column_count = parameters ? 7 : 6;
+    size_t widths[TABLE_MAX_COLUMNS] = { 0 };
+    size_t i;
+
+    for (i = 0; i < column_count; ++i)
+        widths[i] = text_display_width(headers[i]);
+    for (i = 0; i < g_server_count; ++i) {
+        char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY] = { 0 };
+        const char* row[TABLE_MAX_COLUMNS];
+        size_t column;
+        make_server_cells(&g_servers[i], i + 1, parameters, cells);
+        for (column = 0; column < column_count; ++column)
+            row[column] = cells[column];
+        update_column_widths(widths, row, column_count);
+    }
+
+    printf("\n%s：\n", parameters ? "DHCP 分配参数" : "DHCP 服务器信息");
+    print_table_border(widths, column_count);
+    print_colored_table_header(headers, widths, colors, column_count);
+    print_table_border(widths, column_count);
+    for (i = 0; i < g_server_count; ++i) {
+        char cells[TABLE_MAX_COLUMNS][TABLE_CELL_CAPACITY] = { 0 };
+        const char* row[TABLE_MAX_COLUMNS];
+        size_t column;
+        make_server_cells(&g_servers[i], i + 1, parameters, cells);
+        for (column = 0; column < column_count; ++column)
+            row[column] = cells[column];
+        print_table_row(row, widths, column_count);
+    }
+    print_table_border(widths, column_count);
+}
+
+static int resolve_mac(const AdapterInfo* adapter, const struct in_addr* address,
+                       unsigned char* mac)
+{
+    ULONG physical_address[2] = { 0, 0 };
+    ULONG physical_address_length = 6;
+    IPAddr source_address = 0;
+
+    if (adapter->has_ipv4)
+        InetPtonA(AF_INET, adapter->ipv4, &source_address);
+    if (SendARP(address->s_addr, source_address, physical_address,
+                &physical_address_length) != NO_ERROR || physical_address_length < 6)
+        return 0;
+    memcpy(mac, physical_address, 6);
+    return 1;
+}
+
+static int parse_offer(const unsigned char* packet, int length, unsigned int xid,
+                       const AdapterInfo* adapter, const struct sockaddr_in* from,
+                       DHCPOffer* offer)
+{
+    size_t offset = 240;
+    int message_type = 0;
+    unsigned int wire_xid = htonl(xid);
+    struct in_addr source_address;
+
+    if (length < 240 || packet[0] != 2 || packet[1] != 1 || packet[2] != 6)
+        return 0;
+    if (memcmp(packet + 4, &wire_xid, sizeof(wire_xid)) != 0 ||
+        memcmp(packet + 28, adapter->mac, sizeof(adapter->mac)) != 0)
+        return 0;
+    if (packet[236] != 99 || packet[237] != 130 ||
+        packet[238] != 83 || packet[239] != 99)
+        return 0;
+
+    memset(offer, 0, sizeof(*offer));
+    copy_ipv4(offer->assigned_ip, sizeof(offer->assigned_ip), packet + 16);
+    while (offset < (size_t)length) {
+        unsigned char option = packet[offset++];
+        unsigned char option_length;
+        const unsigned char* value;
+
+        if (option == 255)
+            break;
+        if (option == 0)
+            continue;
+        if (offset >= (size_t)length)
+            return 0;
+        option_length = packet[offset++];
+        if (offset + option_length > (size_t)length)
+            return 0;
+        value = packet + offset;
+        switch (option) {
+        case 1:
+            if (option_length == 4)
+                copy_ipv4(offer->subnet_mask, sizeof(offer->subnet_mask), value);
+            break;
+        case 3:
+            format_address_list(offer->gateway, sizeof(offer->gateway),
+                                value, option_length);
+            break;
+        case 6:
+            format_address_list(offer->dns, sizeof(offer->dns), value, option_length);
+            break;
+        case 12:
+            copy_option_text(offer->hostname, sizeof(offer->hostname),
+                             value, option_length);
+            break;
+        case 51:
+            if (option_length == 4) {
+                unsigned long lease_seconds = ((unsigned long)value[0] << 24) |
+                    ((unsigned long)value[1] << 16) |
+                    ((unsigned long)value[2] << 8) | (unsigned long)value[3];
+                if (lease_seconds == 0xFFFFFFFFUL)
+                    strncpy_s(offer->lease, sizeof(offer->lease), "无限", _TRUNCATE);
+                else
+                    _snprintf_s(offer->lease, sizeof(offer->lease), _TRUNCATE,
+                                "%lu 秒", lease_seconds);
+            }
+            break;
+        case 53:
+            if (option_length == 1)
+                message_type = value[0];
+            break;
+        case 54:
+            if (option_length == 4)
+                copy_ipv4(offer->server_ip, sizeof(offer->server_ip), value);
+            break;
+        case 60:
+            copy_option_text(offer->vendor_class, sizeof(offer->vendor_class),
+                             value, option_length);
+            break;
+        default:
+            break;
+        }
+        offset += option_length;
+    }
+
+    if (message_type != 2)
+        return 0;
+    if (!offer->server_ip[0]) {
+        source_address = from->sin_addr;
+        if (InetNtopA(AF_INET, &source_address, offer->server_ip,
+                      (DWORD)sizeof(offer->server_ip)) == NULL)
+            return 0;
+    }
+    return 1;
+}
+
+static int server_exists(size_t adapter_number, const char* server_ip, const char* server_mac)
+{
+    size_t i;
+    for (i = 0; i < g_server_count; ++i) {
+        if (g_servers[i].adapter_number == adapter_number &&
+            strcmp(g_servers[i].server_ip, server_ip) == 0 &&
+            strcmp(g_servers[i].server_mac, server_mac) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+static int add_server(size_t adapter_number, const AdapterInfo* adapter,
+                      const struct sockaddr_in* from, const DHCPOffer* offer,
+                      unsigned long long response_ms)
+{
+    unsigned char mac[6] = { 0 };
+    char mac_text[18];
+    DHCPServer* server;
+
+    if (resolve_mac(adapter, &from->sin_addr, mac))
+        format_mac(mac_text, sizeof(mac_text), mac);
+    else
+        strncpy_s(mac_text, sizeof(mac_text), "未知", _TRUNCATE);
+
+    if (server_exists(adapter_number, offer->server_ip, mac_text))
+        return 0;
+    if (g_server_count == g_server_capacity) {
+        size_t new_capacity = g_server_capacity ? g_server_capacity * 2 : 16;
+        DHCPServer* new_servers = (DHCPServer*)realloc(
+            g_servers, new_capacity * sizeof(*g_servers));
+        if (!new_servers) {
+            fprintf(stderr, "保存 DHCP 服务器结果失败。\n");
+            return -1;
+        }
+        g_servers = new_servers;
+        g_server_capacity = new_capacity;
+    }
+
+    server = &g_servers[g_server_count];
+    memset(server, 0, sizeof(*server));
+    strncpy_s(server->server_ip, sizeof(server->server_ip), offer->server_ip, _TRUNCATE);
+    strncpy_s(server->server_mac, sizeof(server->server_mac), mac_text, _TRUNCATE);
+    build_device_vendor(server->device_vendor, sizeof(server->device_vendor), mac, offer);
+    strncpy_s(server->assigned_ip, sizeof(server->assigned_ip),
+              offer->assigned_ip[0] ? offer->assigned_ip : "未提供", _TRUNCATE);
+    strncpy_s(server->subnet_mask, sizeof(server->subnet_mask),
+              offer->subnet_mask[0] ? offer->subnet_mask : "未提供", _TRUNCATE);
+    strncpy_s(server->gateway, sizeof(server->gateway),
+              offer->gateway[0] ? offer->gateway : "未提供", _TRUNCATE);
+    strncpy_s(server->dns, sizeof(server->dns),
+              offer->dns[0] ? offer->dns : "未提供", _TRUNCATE);
+    strncpy_s(server->lease, sizeof(server->lease),
+              offer->lease[0] ? offer->lease : "未提供", _TRUNCATE);
+    server->response_ms = response_ms;
+    server->adapter_number = adapter_number;
+    GetLocalTime(&server->discovered_at);
+
+    ++g_server_count;
+    return 1;
+}
+
+static int build_dhcp_discover(unsigned char* packet, size_t capacity,
+                               const unsigned char* mac, unsigned int xid)
+{
+    static const unsigned char parameter_request_list[] = {
+        1, 3, 6, 12, 15, 51, 54, 58, 59, 66, 67
+    };
+    unsigned int wire_xid = htonl(xid);
+    size_t offset = 240;
+
+    if (capacity < 300)
+        return 0;
+    memset(packet, 0, capacity);
+    packet[0] = 1;
+    packet[1] = 1;
+    packet[2] = 6;
+    memcpy(packet + 4, &wire_xid, sizeof(wire_xid));
+    packet[10] = 0x80;
+    memcpy(packet + 28, mac, 6);
+    packet[236] = 99;
+    packet[237] = 130;
+    packet[238] = 83;
+    packet[239] = 99;
+    packet[offset++] = 53;
+    packet[offset++] = 1;
+    packet[offset++] = 1;
+    packet[offset++] = 55;
+    packet[offset++] = (unsigned char)sizeof(parameter_request_list);
+    memcpy(packet + offset, parameter_request_list, sizeof(parameter_request_list));
+    offset += sizeof(parameter_request_list);
+    packet[offset++] = 255;
+    return 300;
+}
+
+static int scan_adapter(const AdapterInfo* adapter, size_t adapter_number)
+{
+    SOCKET socket_handle;
+    struct sockaddr_in local;
+    struct sockaddr_in destination;
+    ULONGLONG ticks = GetTickCount64();
+    unsigned int xid = (unsigned int)(ticks ^ (ticks >> 32) ^
+                                     (adapter_number * 2654435761ULL));
+    int option = 1;
+    int found_in_window;
+
+    socket_handle = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (socket_handle == INVALID_SOCKET) {
+        fprintf(stderr, "网卡 %zu 创建 socket 失败: %d\n", adapter_number, WSAGetLastError());
+        return 0;
+    }
+    if (setsockopt(socket_handle, SOL_SOCKET, SO_REUSEADDR,
+                   (const char*)&option, sizeof(option)) == SOCKET_ERROR ||
+        setsockopt(socket_handle, SOL_SOCKET, SO_BROADCAST,
+                   (const char*)&option, sizeof(option)) == SOCKET_ERROR) {
+        fprintf(stderr, "网卡 %zu 设置 socket 选项失败: %d\n",
+                adapter_number, WSAGetLastError());
+        closesocket(socket_handle);
+        return 0;
+    }
+
+#ifdef IP_UNICAST_IF
+    {
+        DWORD interface_index = htonl(adapter->interface_index);
+        if (setsockopt(socket_handle, IPPROTO_IP, IP_UNICAST_IF,
+                       (const char*)&interface_index, sizeof(interface_index)) == SOCKET_ERROR) {
+            fprintf(stderr, "网卡 %zu 绑定出口接口失败: %d\n",
+                    adapter_number, WSAGetLastError());
+            closesocket(socket_handle);
+            return 0;
+        }
+    }
+#endif
 
     memset(&local, 0, sizeof(local));
     local.sin_family = AF_INET;
     local.sin_port = htons(DHCP_CLIENT_PORT);
-    local.sin_addr.s_addr = inet_addr(adapter->Ip);
-    if (bind(sock, (struct sockaddr*)&local, sizeof(local)) < 0) {
-        printf("绑定失败，可能需要管理员权限\n");
-        closesocket(sock);
+    local.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(socket_handle, (struct sockaddr*)&local, sizeof(local)) == SOCKET_ERROR) {
+        fprintf(stderr, "网卡 %zu 绑定 DHCP 客户端端口失败: %d（可能需要管理员权限或端口已被占用）\n",
+                adapter_number, WSAGetLastError());
+        closesocket(socket_handle);
+        return 0;
+    }
+
+    memset(&destination, 0, sizeof(destination));
+    destination.sin_family = AF_INET;
+    destination.sin_port = htons(DHCP_SERVER_PORT);
+    destination.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    printf("\n扫描网卡 %zu: %s (%s)\n", adapter_number,
+           adapter->description, adapter->has_ipv4 ? adapter->ipv4 : "无 IPv4");
+
+    do {
+        unsigned char packet[DHCP_PACKET_SIZE];
+        int packet_length;
+        ULONGLONG window_start = GetTickCount64();
+        ULONGLONG next_send = window_start;
+        found_in_window = 0;
+        ++xid;
+        packet_length = build_dhcp_discover(packet, sizeof(packet), adapter->mac, xid);
+        if (!packet_length) {
+            closesocket(socket_handle);
+            return 0;
+        }
+
+        while (GetTickCount64() - window_start < DHCP_SCAN_WINDOW_MS) {
+            ULONGLONG now = GetTickCount64();
+            ULONGLONG elapsed;
+            ULONGLONG until_send;
+            struct timeval timeout;
+            fd_set read_set;
+
+            if (now >= next_send) {
+                if (sendto(socket_handle, (const char*)packet, packet_length, 0,
+                           (struct sockaddr*)&destination, sizeof(destination)) == SOCKET_ERROR) {
+                    fprintf(stderr, "网卡 %zu 发送 DHCP Discover 失败: %d\n",
+                            adapter_number, WSAGetLastError());
+                    closesocket(socket_handle);
+                    return 0;
+                }
+                next_send = now + DHCP_RETRY_INTERVAL_MS;
+            }
+
+            now = GetTickCount64();
+            elapsed = now - window_start;
+            if (elapsed >= DHCP_SCAN_WINDOW_MS)
+                break;
+            until_send = next_send > now ? next_send - now : 0;
+            if (until_send > 200)
+                until_send = 200;
+            timeout.tv_sec = (long)(until_send / 1000);
+            timeout.tv_usec = (long)((until_send % 1000) * 1000);
+            FD_ZERO(&read_set);
+            FD_SET(socket_handle, &read_set);
+            if (select(0, &read_set, NULL, NULL, &timeout) == SOCKET_ERROR) {
+                fprintf(stderr, "网卡 %zu 等待 DHCP 响应失败: %d\n",
+                        adapter_number, WSAGetLastError());
+                closesocket(socket_handle);
+                return 0;
+            }
+            if (FD_ISSET(socket_handle, &read_set)) {
+                unsigned char response[1500];
+                struct sockaddr_in from;
+                int from_length = sizeof(from);
+                int received = recvfrom(socket_handle, (char*)response, sizeof(response), 0,
+                                        (struct sockaddr*)&from, &from_length);
+                if (received == SOCKET_ERROR) {
+                    fprintf(stderr, "网卡 %zu 接收 DHCP 响应失败: %d\n",
+                            adapter_number, WSAGetLastError());
+                    closesocket(socket_handle);
+                    return 0;
+                }
+                {
+                    DHCPOffer offer;
+                    if (parse_offer(response, received, xid, adapter, &from, &offer)) {
+                        int added = add_server(adapter_number, adapter, &from, &offer,
+                                               GetTickCount64() - window_start);
+                        if (added < 0) {
+                            closesocket(socket_handle);
+                            return 0;
+                        }
+                        if (added > 0)
+                            found_in_window = 1;
+                    }
+                }
+            }
+        }
+        if (found_in_window)
+            printf("网卡 %zu 本轮发现新服务器，继续扫描 2 秒以查找其他服务器。\n",
+                   adapter_number);
+    } while (found_in_window);
+
+    closesocket(socket_handle);
+    printf("网卡 %zu 本轮无新服务器，切换到下一张网卡。\n", adapter_number);
+    return 1;
+}
+
+int main(void)
+{
+    WSADATA winsock_data;
+    AdapterInfo* adapters = NULL;
+    size_t adapter_count = 0;
+    size_t oui_count;
+    size_t i;
+    char oui_path[MAX_PATH] = { 0 };
+
+    SetConsoleOutputCP(CP_UTF8);
+    initialize_console_colors();
+    if (WSAStartup(MAKEWORD(2, 2), &winsock_data) != 0) {
+        fprintf(stderr, "WSAStartup 初始化失败。\n");
+        return 1;
+    }
+    oui_count = load_oui_database(oui_path, sizeof(oui_path));
+    if (oui_count != 0)
+        printf("已从 %s 加载 %zu 条 OUI 记录。\n", oui_path, oui_count);
+    else if (oui_path[0])
+        printf("文件 %s 中没有可识别的 (hex) 条目，使用内置 OUI 表。\n", oui_path);
+    else
+        printf("未找到 oui.txt，使用内置 OUI 表；请将文件放在程序工作目录或程序目录及其上级目录。\n");
+
+    if (!get_adapters(&adapters, &adapter_count)) {
+        free(g_oui_records);
+        WSACleanup();
+        return 1;
+    }
+    print_adapters(adapters, adapter_count);
+    if (adapter_count == 0) {
+        printf("未检测到网卡。\n");
+        free(adapters);
+        free(g_oui_records);
         WSACleanup();
         return 1;
     }
 
-    memset(&to, 0, sizeof(to));
-    to.sin_family = AF_INET;
-    to.sin_port = htons(DHCP_SERVER_PORT);
-    to.sin_addr.s_addr = INADDR_BROADCAST;
+    for (i = 0; i < adapter_count; ++i) {
+        if (!adapters[i].is_up)
+            continue;
+        if (adapters[i].interface_index == 0 || !adapters[i].has_mac) {
+            printf("网卡 %zu 缺少有效接口索引或 MAC，跳过扫描。\n", i + 1);
+            continue;
+        }
+        scan_adapter(&adapters[i], i + 1);
+    }
 
-    ThreadArgs args;
-    args.sock = sock;
-    args.adapter = adapter;
-    args.to = to;
-
-    uintptr_t th1 = _beginthreadex(NULL, 0, sender_thread, &args, 0, NULL);
-    uintptr_t th2 = _beginthreadex(NULL, 0, receiver_thread, &args, 0, NULL);
-
-    printf("正在多线程轮询发送DHCP Discover包，并监听响应...\n按Ctrl+C退出\n");
-
-    // 主线程等待子线程结束
-    WaitForSingleObject((HANDLE)th1, INFINITE);
-    WaitForSingleObject((HANDLE)th2, INFINITE);
-
-    closesocket(sock);
+    printf("\n扫描完成，共发现 %zu 个 DHCP 服务器记录。\n", g_server_count);
+    if (g_server_count != 0) {
+        print_server_table(0);
+        print_server_table(1);
+    }
+    free(g_servers);
+    free(adapters);
+    free(g_oui_records);
     WSACleanup();
-    DeleteCriticalSection(&cs_servers);
     return 0;
 }
