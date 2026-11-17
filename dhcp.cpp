@@ -10,18 +10,23 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 #include <iphlpapi.h>
+#include <urlmon.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <wchar.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "urlmon.lib")
 
 #define DHCP_SERVER_PORT 67
 #define DHCP_CLIENT_PORT 68
 #define DHCP_PACKET_SIZE 576
 #define DHCP_SCAN_WINDOW_MS 2000
 #define DHCP_RETRY_INTERVAL_MS 1000
+#define ARP_PROBES_PER_OFFER 6
+#define ARP_PROBE_INTERVAL_MS 100
 #define TABLE_MAX_COLUMNS 8
 #define TABLE_CELL_CAPACITY 512
 #define HEADER_COLOR_DISCOVERY \
@@ -135,36 +140,6 @@ static void format_mac(char* destination, size_t capacity, const unsigned char* 
                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
-typedef struct {
-    unsigned char prefix[3];
-    const char* vendor;
-} OuiEntry;
-
-static const OuiEntry g_oui_table[] = {
-    { { 0x00, 0x1B, 0x2F }, "Cisco" },
-    { { 0x00, 0x1E, 0x10 }, "TP-Link" },
-    { { 0x14, 0xCC, 0x20 }, "TP-Link" },
-    { { 0x50, 0xC7, 0xBF }, "TP-Link" },
-    { { 0xC0, 0x25, 0xE9 }, "TP-Link" },
-    { { 0x00, 0x1F, 0xA4 }, "Netgear" },
-    { { 0x20, 0x4E, 0x7F }, "Netgear" },
-    { { 0xA0, 0x40, 0xA0 }, "Netgear" },
-    { { 0x00, 0x1D, 0x0F }, "D-Link" },
-    { { 0x1C, 0x7E, 0xE5 }, "D-Link" },
-    { { 0x00, 0x18, 0x82 }, "D-Link" },
-    { { 0x00, 0x1E, 0x58 }, "Huawei" },
-    { { 0x00, 0x25, 0x9E }, "Huawei" },
-    { { 0x48, 0x46, 0xFB }, "Huawei" },
-    { { 0x00, 0x0C, 0xE7 }, "ZTE" },
-    { { 0x34, 0x4B, 0x50 }, "ZTE" },
-    { { 0x00, 0x1C, 0xDF }, "Billion" },
-    { { 0x00, 0x24, 0x01 }, "Apple" },
-    { { 0x3C, 0x07, 0x54 }, "Apple" },
-    { { 0x00, 0x50, 0x56 }, "VMware" },
-    { { 0x08, 0x00, 0x27 }, "VirtualBox" },
-    { { 0x00, 0x15, 0x5D }, "Hyper-V" }
-};
-
 static int hex_nibble(char value)
 {
     if (value >= '0' && value <= '9')
@@ -231,64 +206,63 @@ static int parse_oui_line(const char* line, OUIRecord* record)
     return record->vendor[0] != '\0';
 }
 
-static FILE* open_oui_file_in_directory(const char* directory,
-                                        char* resolved_path, size_t path_capacity)
+static FILE* open_oui_file(void)
 {
-    char candidate[MAX_PATH];
+    static const wchar_t oui_url[] =
+        L"https://standards-oui.ieee.org/oui/oui.txt";
+    wchar_t path[MAX_PATH];
+    wchar_t* file_name;
+    DWORD path_length;
     FILE* file = NULL;
+    HRESULT download_result;
 
-    if (directory[0] == '\0')
-        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE, "oui.txt");
-    else
-        _snprintf_s(candidate, sizeof(candidate), _TRUNCATE,
-                    "%s\\oui.txt", directory);
-    if (fopen_s(&file, candidate, "rt") != 0)
+    path_length = GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (path_length == 0 || path_length >= MAX_PATH) {
+        fprintf(stderr, "无法获取程序路径，不能定位同目录下的 oui.txt。\n");
         return NULL;
-    strncpy_s(resolved_path, path_capacity, candidate, _TRUNCATE);
+    }
+
+    file_name = wcsrchr(path, L'\\');
+    if (!file_name) {
+        fprintf(stderr, "程序路径格式无效，不能定位同目录下的 oui.txt。\n");
+        return NULL;
+    }
+    ++file_name;
+    if (wcscpy_s(file_name, MAX_PATH - (size_t)(file_name - path), L"oui.txt") != 0) {
+        fprintf(stderr, "oui.txt 路径过长。\n");
+        return NULL;
+    }
+
+    if (_wfopen_s(&file, path, L"rt") == 0) {
+        printf("正在使用程序同目录下的 oui.txt。\n");
+        return file;
+    }
+    if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+        fprintf(stderr, "程序同目录下的 oui.txt 存在但无法读取，厂商识别不可用。\n");
+        return NULL;
+    }
+
+    printf("程序同目录下未找到 oui.txt，正在从 IEEE 下载...\n");
+    download_result = URLDownloadToFileW(NULL, oui_url, path, 0, NULL);
+    if (FAILED(download_result)) {
+        DeleteFileW(path);
+        fprintf(stderr, "下载 IEEE OUI 数据库失败（HRESULT 0x%08lX），厂商识别不可用。\n",
+                (unsigned long)download_result);
+        return NULL;
+    }
+
+    if (_wfopen_s(&file, path, L"rt") != 0) {
+        fprintf(stderr, "IEEE OUI 文件已下载，但无法从程序目录读取；请检查目录权限。\n");
+        return NULL;
+    }
+    printf("IEEE oui.txt 已下载到程序同目录。\n");
     return file;
 }
 
-static FILE* open_oui_file(char* resolved_path, size_t path_capacity)
-{
-    char directory[MAX_PATH];
-    DWORD length;
-    FILE* file;
-    unsigned int depth;
-
-    length = GetCurrentDirectoryA(MAX_PATH, directory);
-    if (length > 0 && length < MAX_PATH) {
-        file = open_oui_file_in_directory(directory, resolved_path, path_capacity);
-        if (file)
-            return file;
-    }
-
-    length = GetModuleFileNameA(NULL, directory, MAX_PATH);
-    if (length == 0 || length >= MAX_PATH)
-        return NULL;
-    {
-        char* slash = strrchr(directory, '\\');
-        if (!slash)
-            return NULL;
-        *slash = '\0';
-    }
-
-    for (depth = 0; depth < 6; ++depth) {
-        char* slash;
-        file = open_oui_file_in_directory(directory, resolved_path, path_capacity);
-        if (file)
-            return file;
-        slash = strrchr(directory, '\\');
-        if (!slash || (slash == directory + 2 && directory[1] == ':'))
-            break;
-        *slash = '\0';
-    }
-    return NULL;
-}
-
-static size_t load_oui_database(char* loaded_path, size_t path_capacity)
+static size_t load_oui_database(void)
 {
     char line[512];
-    FILE* file = open_oui_file(loaded_path, path_capacity);
+    FILE* file = open_oui_file();
     if (!file)
         return 0;
 
@@ -348,11 +322,6 @@ static const char* lookup_oui_vendor(const unsigned char* mac)
     }
     if (best_match)
         return best_match->vendor;
-
-    for (i = 0; i < sizeof(g_oui_table) / sizeof(g_oui_table[0]); ++i) {
-        if (memcmp(mac, g_oui_table[i].prefix, sizeof(g_oui_table[i].prefix)) == 0)
-            return g_oui_table[i].vendor;
-    }
     return "未知厂商";
 }
 
@@ -674,7 +643,7 @@ static void print_server_table(int parameters)
         FOREGROUND_BLUE | FOREGROUND_INTENSITY,
         FOREGROUND_RED | FOREGROUND_BLUE | FOREGROUND_INTENSITY,
         FOREGROUND_RED | FOREGROUND_INTENSITY,
-        FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY
+        FOREGROUND_GREEN | FOREGROUND_BLUE
     };
     static const char* identity_headers[] = {
         "发现序号", "网卡序号", "发现时间", "服务器 IP", "服务器 MAC", "设备/厂商"
@@ -716,16 +685,31 @@ static void print_server_table(int parameters)
     print_table_border(widths, column_count);
 }
 
-static int resolve_mac(const AdapterInfo* adapter, const struct in_addr* address,
-                       unsigned char* mac)
+static int resolve_mac(const AdapterInfo* adapter, const char* server_ip,
+                       unsigned char* mac, DWORD* arp_delete_error)
 {
     ULONG physical_address[2] = { 0, 0 };
     ULONG physical_address_length = 6;
     IPAddr source_address = 0;
+    struct in_addr target_address;
+    MIB_IPNETROW arp_entry;
+    DWORD delete_result;
 
+    if (InetPtonA(AF_INET, server_ip, &target_address) != 1)
+        return 0;
     if (adapter->has_ipv4)
         InetPtonA(AF_INET, adapter->ipv4, &source_address);
-    if (SendARP(address->s_addr, source_address, physical_address,
+
+    memset(&arp_entry, 0, sizeof(arp_entry));
+    arp_entry.dwIndex = adapter->interface_index;
+    arp_entry.dwAddr = target_address.s_addr;
+    delete_result = DeleteIpNetEntry(&arp_entry);
+    if (delete_result != NO_ERROR && delete_result != ERROR_NOT_FOUND &&
+        delete_result != ERROR_FILE_NOT_FOUND && arp_delete_error &&
+        *arp_delete_error == NO_ERROR)
+        *arp_delete_error = delete_result;
+
+    if (SendARP(target_address.s_addr, source_address, physical_address,
                 &physical_address_length) != NO_ERROR || physical_address_length < 6)
         return 0;
     memcpy(mac, physical_address, 6);
@@ -824,33 +808,56 @@ static int parse_offer(const unsigned char* packet, int length, unsigned int xid
     return 1;
 }
 
-static int server_exists(size_t adapter_number, const char* server_ip, const char* server_mac)
+static int find_server(size_t adapter_number, const char* server_ip, const char* server_mac)
 {
     size_t i;
     for (i = 0; i < g_server_count; ++i) {
         if (g_servers[i].adapter_number == adapter_number &&
             strcmp(g_servers[i].server_ip, server_ip) == 0 &&
             strcmp(g_servers[i].server_mac, server_mac) == 0)
-            return 1;
+            return (int)i;
     }
-    return 0;
+    return -1;
 }
 
-static int add_server(size_t adapter_number, const AdapterInfo* adapter,
-                      const struct sockaddr_in* from, const DHCPOffer* offer,
-                      unsigned long long response_ms)
+static void update_server_offer(DHCPServer* server, const DHCPOffer* offer,
+                                unsigned long long response_ms)
 {
-    unsigned char mac[6] = { 0 };
-    char mac_text[18];
+    strncpy_s(server->assigned_ip, sizeof(server->assigned_ip),
+              offer->assigned_ip[0] ? offer->assigned_ip : "未提供", _TRUNCATE);
+    strncpy_s(server->subnet_mask, sizeof(server->subnet_mask),
+              offer->subnet_mask[0] ? offer->subnet_mask : "未提供", _TRUNCATE);
+    strncpy_s(server->gateway, sizeof(server->gateway),
+              offer->gateway[0] ? offer->gateway : "未提供", _TRUNCATE);
+    strncpy_s(server->dns, sizeof(server->dns),
+              offer->dns[0] ? offer->dns : "未提供", _TRUNCATE);
+    strncpy_s(server->lease, sizeof(server->lease),
+              offer->lease[0] ? offer->lease : "未提供", _TRUNCATE);
+    server->response_ms = response_ms;
+}
+
+static int store_server(size_t adapter_number, const DHCPOffer* offer,
+                        const unsigned char* mac,
+                        const char* mac_text, unsigned long long response_ms)
+{
     DHCPServer* server;
+    int existing_index = find_server(adapter_number, offer->server_ip, mac_text);
 
-    if (resolve_mac(adapter, &from->sin_addr, mac))
-        format_mac(mac_text, sizeof(mac_text), mac);
-    else
-        strncpy_s(mac_text, sizeof(mac_text), "未知", _TRUNCATE);
-
-    if (server_exists(adapter_number, offer->server_ip, mac_text))
+    if (existing_index >= 0)
         return 0;
+
+    if (strcmp(mac_text, "未知") != 0) {
+        int unknown_index = find_server(adapter_number, offer->server_ip, "未知");
+        if (unknown_index >= 0) {
+            server = &g_servers[unknown_index];
+            strncpy_s(server->server_mac, sizeof(server->server_mac), mac_text, _TRUNCATE);
+            build_device_vendor(server->device_vendor, sizeof(server->device_vendor),
+                                mac, offer);
+            update_server_offer(server, offer, response_ms);
+            return 1;
+        }
+    }
+
     if (g_server_count == g_server_capacity) {
         size_t new_capacity = g_server_capacity ? g_server_capacity * 2 : 16;
         DHCPServer* new_servers = (DHCPServer*)realloc(
@@ -868,22 +875,55 @@ static int add_server(size_t adapter_number, const AdapterInfo* adapter,
     strncpy_s(server->server_ip, sizeof(server->server_ip), offer->server_ip, _TRUNCATE);
     strncpy_s(server->server_mac, sizeof(server->server_mac), mac_text, _TRUNCATE);
     build_device_vendor(server->device_vendor, sizeof(server->device_vendor), mac, offer);
-    strncpy_s(server->assigned_ip, sizeof(server->assigned_ip),
-              offer->assigned_ip[0] ? offer->assigned_ip : "未提供", _TRUNCATE);
-    strncpy_s(server->subnet_mask, sizeof(server->subnet_mask),
-              offer->subnet_mask[0] ? offer->subnet_mask : "未提供", _TRUNCATE);
-    strncpy_s(server->gateway, sizeof(server->gateway),
-              offer->gateway[0] ? offer->gateway : "未提供", _TRUNCATE);
-    strncpy_s(server->dns, sizeof(server->dns),
-              offer->dns[0] ? offer->dns : "未提供", _TRUNCATE);
-    strncpy_s(server->lease, sizeof(server->lease),
-              offer->lease[0] ? offer->lease : "未提供", _TRUNCATE);
-    server->response_ms = response_ms;
+    update_server_offer(server, offer, response_ms);
     server->adapter_number = adapter_number;
     GetLocalTime(&server->discovered_at);
 
     ++g_server_count;
     return 1;
+}
+
+static int add_server(size_t adapter_number, const AdapterInfo* adapter,
+                      const DHCPOffer* offer, unsigned long long response_ms)
+{
+    unsigned char mac[6] = { 0 };
+    char mac_text[18];
+    DWORD arp_delete_error = NO_ERROR;
+    int resolved_count = 0;
+    int added_count = 0;
+    int probe;
+
+    for (probe = 0; probe < ARP_PROBES_PER_OFFER; ++probe) {
+        int added;
+        if (resolve_mac(adapter, offer->server_ip, mac, &arp_delete_error)) {
+            ++resolved_count;
+            format_mac(mac_text, sizeof(mac_text), mac);
+            added = store_server(adapter_number, offer, mac,
+                                 mac_text, response_ms);
+            if (added < 0)
+                return -1;
+            added_count += added;
+        }
+        if (probe + 1 < ARP_PROBES_PER_OFFER)
+            Sleep(ARP_PROBE_INTERVAL_MS);
+    }
+
+    if (arp_delete_error != NO_ERROR) {
+        fprintf(stderr,
+                "网卡 %zu 删除服务器 %s 的 ARP 缓存失败（错误码 %lu）；请以管理员身份运行以提高不同 MAC 的识别率。\n",
+                adapter_number, offer->server_ip, arp_delete_error);
+    }
+    if (resolved_count == 0) {
+        strncpy_s(mac_text, sizeof(mac_text), "未知", _TRUNCATE);
+        added_count = store_server(adapter_number, offer, mac,
+                                   mac_text, response_ms);
+        if (added_count < 0)
+            return -1;
+        fprintf(stderr,
+                "网卡 %zu 对 DHCP 服务器 %s 的 %d 次 ARP 查询均未获得 MAC。\n",
+                adapter_number, offer->server_ip, ARP_PROBES_PER_OFFER);
+    }
+    return added_count;
 }
 
 static int build_dhcp_discover(unsigned char* packet, size_t capacity,
@@ -1039,8 +1079,9 @@ static int scan_adapter(const AdapterInfo* adapter, size_t adapter_number)
                 {
                     DHCPOffer offer;
                     if (parse_offer(response, received, xid, adapter, &from, &offer)) {
-                        int added = add_server(adapter_number, adapter, &from, &offer,
-                                               GetTickCount64() - window_start);
+                        unsigned long long response_ms = GetTickCount64() - window_start;
+                        int added = add_server(adapter_number, adapter, &offer,
+                                               response_ms);
                         if (added < 0) {
                             closesocket(socket_handle);
                             return 0;
@@ -1068,7 +1109,6 @@ int main(void)
     size_t adapter_count = 0;
     size_t oui_count;
     size_t i;
-    char oui_path[MAX_PATH] = { 0 };
 
     SetConsoleOutputCP(CP_UTF8);
     initialize_console_colors();
@@ -1076,13 +1116,11 @@ int main(void)
         fprintf(stderr, "WSAStartup 初始化失败。\n");
         return 1;
     }
-    oui_count = load_oui_database(oui_path, sizeof(oui_path));
+    oui_count = load_oui_database();
     if (oui_count != 0)
-        printf("已从 %s 加载 %zu 条 OUI 记录。\n", oui_path, oui_count);
-    else if (oui_path[0])
-        printf("文件 %s 中没有可识别的 (hex) 条目，使用内置 OUI 表。\n", oui_path);
+        printf("已加载 %zu 条 OUI 记录。\n", oui_count);
     else
-        printf("未找到 oui.txt，使用内置 OUI 表；请将文件放在程序工作目录或程序目录及其上级目录。\n");
+        fprintf(stderr, "OUI 数据库没有有效条目，厂商名称将显示为“未知厂商”。\n");
 
     if (!get_adapters(&adapters, &adapter_count)) {
         free(g_oui_records);
