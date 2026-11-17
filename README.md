@@ -29,3 +29,9 @@ permissions or conflict with the Windows DHCP client service. Administrator
 privileges also improve ARP cache deletion. When building in Visual Studio,
 use the `/utf-8` compiler option so UTF-8 source and console text are handled
 consistently.
+
+The Linux x86_64 source and build instructions are in [`dhcp_linux.c`](dhcp_linux.c)
+and [`README_LINUX.md`](README_LINUX.md); the Windows source remains `dhcp.cpp`.
+
+The macOS arm64 source and build instructions are in [`dhcp_macos.c`](dhcp_macos.c)
+and [`README_MACOS.md`](README_MACOS.md).
